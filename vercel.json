@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "api/**/*.go",
+      "use": "@vercel/go"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/webhook.go"
+    }
+  ]
+}
