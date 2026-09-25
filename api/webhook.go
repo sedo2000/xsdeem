@@ -57,14 +57,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ----------------------------------------------------
-	// 1. التعامل مع الأزرار الشفافة والملونة (Callback Query)
-	// ----------------------------------------------------
+	// 1. التعامل مع الأزرار الشفافة والملونة
 	if update.CallbackQuery != nil {
 		chatID := update.CallbackQuery.Message.Chat.ID
 		data := update.CallbackQuery.Data
 
-		// إخفاء علامة التحميل (الساعة الرملية) من الزر
 		bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, ""))
 
 		var artist, title string
@@ -75,10 +72,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		case "settings":
 			saveUserState(chatID, 1, artist, title, cover)
 			msg := tgbotapi.NewMessage(chatID, "✨ **بدء ضبط الإعدادات**\n\n🎤 أرسل لي الآن **اسم الفنان**:")
-			msg.ReplyMarkup = cancelKeyboard() // زر إلغاء عادي
+			msg.ReplyMarkup = cancelKeyboard()
 			bot.Send(msg)
 		case "cancel":
-			saveUserState(chatID, 4, artist, title, cover) // العودة لوضع الاستعداد
+			saveUserState(chatID, 4, artist, title, cover)
 			msg := tgbotapi.NewMessage(chatID, "❌ **تم إلغاء العملية.**\nتم الحفاظ على إعداداتك السابقة.")
 			bot.Send(msg)
 		case "status":
@@ -101,7 +98,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	chatID := update.Message.Chat.ID
 	text := update.Message.Text
 
-	// استخراج حالة المستخدم من قاعدة البيانات
 	var step int
 	var artist, title string
 	var cover []byte
@@ -110,21 +106,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		step = 0
 	}
 
-	// ----------------------------------------------------
 	// 2. التعامل مع الأوامر (/start)
-	// ----------------------------------------------------
 	if update.Message.IsCommand() {
 		switch update.Message.Command() {
 		case "start", "menu":
-			sendColoredMainMenu(botToken, chatID) // استدعاء الدالة المخصصة للأزرار الملونة
+			sendColoredMainMenu(botToken, chatID)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}
 
-	// ----------------------------------------------------
-	// 3. مسار المحادثة (State Machine)
-	// ----------------------------------------------------
+	// 3. مسار المحادثة للإعدادات
 	if step == 1 && text != "" {
 		saveUserState(chatID, 2, text, title, cover)
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ تم حفظ الفنان: **%s**\n\n🎵 أرسل الآن **اسم الملف الصوتي (العنوان)**:", text))
@@ -154,9 +146,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ----------------------------------------------------
 	// 4. معالجة الملفات الصوتية المُرسلة
-	// ----------------------------------------------------
 	if update.Message.Audio != nil || update.Message.Document != nil {
 		if step != 4 || artist == "" {
 			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ يجب إكمال الإعدادات أولاً."))
@@ -182,7 +172,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// استخراج وإرسال الصورة القديمة
 		tag, err := id3v2.ParseReader(bytes.NewReader(audioData), id3v2.Options{Parse: true})
 		if err == nil {
 			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
@@ -195,7 +184,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// تعديل الملف وإرساله
+		// استدعاء دالة التعديل الجديدة التي تحافظ على الصوت
 		editedAudio, err := editAudioTags(audioData, artist, title, cover)
 		if err != nil {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ خطأ في دمج البيانات."))
@@ -219,7 +208,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 // دوال واجهة المستخدم (UI) والأزرار الملونة
 // ----------------------------------------------------
 
-// زر الإلغاء العادي المستخدم أثناء الإعداد
 func cancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -228,11 +216,9 @@ func cancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-// دالة مخصصة لإرسال أزرار ملونة تتخطى قيود المكتبة القديمة وتخاطب API تيليجرام مباشرة
 func sendColoredMainMenu(botToken string, chatID int64) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
 
-	// بناء الـ JSON الخاص بتيليجرام مع إضافة حقل "style" الجديد
 	payload := map[string]interface{}{
 		"chat_id":    chatID,
 		"text":       "🎧 **مرحباً بك في بوت تعديل الصوتيات!**\n\nيُرجى اختيار إجراء من القائمة أدناه:",
@@ -240,15 +226,12 @@ func sendColoredMainMenu(botToken string, chatID int64) {
 		"reply_markup": map[string]interface{}{
 			"inline_keyboard": [][]map[string]interface{}{
 				{
-					// زر باللون الأزرق (الأساسي)
 					{"text": "⚙️ إعداد صورة واسم جديد للملف", "callback_data": "settings", "style": "primary"},
 				},
 				{
-					// زر شفاف/أبيض (افتراضي)
 					{"text": "ℹ️ عرض الإعدادات الحالية", "callback_data": "status"},
 				},
 				{
-					// زر باللون الأحمر (للتحذير/الإلغاء)
 					{"text": "🗑 إلغاء", "callback_data": "cancel", "style": "danger"},
 				},
 			},
@@ -316,12 +299,33 @@ func downloadFile(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// الدالة الجديدة والمحسنة للحفاظ على الصوت (تستخدم ملف مؤقت)
 func editAudioTags(originalAudio []byte, artist, title string, cover []byte) ([]byte, error) {
-	tag, err := id3v2.ParseReader(bytes.NewReader(originalAudio), id3v2.Options{Parse: true})
+	// 1. إنشاء ملف مؤقت في بيئة Vercel
+	tmpFile, err := os.CreateTemp("", "audio-*.mp3")
 	if err != nil {
-		tag = id3v2.NewEmptyTag()
+		return nil, err
 	}
+	tmpFileName := tmpFile.Name()
+	
+	// تأكد من حذف الملف المؤقت بعد انتهاء العملية لتنظيف الذاكرة
+	defer os.Remove(tmpFileName)
 
+	// 2. كتابة الملف الصوتي الأصلي بالكامل داخل الملف المؤقت (لكي نحافظ على الصوت)
+	if _, err := tmpFile.Write(originalAudio); err != nil {
+		tmpFile.Close()
+		return nil, err
+	}
+	tmpFile.Close() // يجب إغلاقه لتتمكن المكتبة من التعديل عليه براحة
+
+	// 3. فتح الملف عبر مكتبة التعديل
+	tag, err := id3v2.Open(tmpFileName, id3v2.Options{Parse: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tag.Close()
+
+	// 4. وضع الإعدادات الجديدة
 	tag.SetArtist(artist)
 	tag.SetTitle(title)
 
@@ -336,9 +340,11 @@ func editAudioTags(originalAudio []byte, artist, title string, cover []byte) ([]
 		tag.AddAttachedPicture(pic)
 	}
 
-	var buf bytes.Buffer
-	if _, err = tag.WriteTo(&buf); err != nil {
+	// 5. حفظ التعديلات على نفس الملف (هذا الأمر يغير البيانات ويحتفظ بالصوت!)
+	if err = tag.Save(); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+
+	// 6. قراءة الملف المُعدل بالكامل كبايتات لإرساله
+	return os.ReadFile(tmpFileName)
 }
