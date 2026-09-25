@@ -123,7 +123,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if step == 2 && text != "" {
 		saveUserState(chatID, 3, artist, text, cover)
-		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ تم حفظ العنوان: **%s**\n\n🖼 أرسل الآن **الصورة المصغرة** (سيتم قص المنتصف تلقائياً):", text))
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ تم حفظ العنوان: **%s**\n\n🖼 أرسل الآن **الصورة المصغرة** (سيتم قص المنتصف وتعديل الحجم تلقائياً):", text))
 		msg.ReplyMarkup = cancelKeyboard()
 		bot.Send(msg)
 		w.WriteHeader(http.StatusOK)
@@ -132,9 +132,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		photo := update.Message.Photo[len(update.Message.Photo)-1]
 		fileURL, _ := bot.GetFileDirectURL(photo.FileID)
 
-		croppedImg, err := cropImageFromCenter(fileURL)
+		croppedImg, err := cropAndResizeImage(fileURL) // تم تحسين الدالة هنا لضغط الصورة
 		if err != nil {
-			bot.Send(tgbotapi.NewMessage(chatID, "❌ حدث خطأ أثناء قص الصورة. حاول إرسال صورة أخرى."))
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ حدث خطأ أثناء معالجة الصورة. حاول إرسال صورة أخرى."))
 		} else {
 			saveUserState(chatID, 4, artist, title, croppedImg)
 			bot.Send(tgbotapi.NewMessage(chatID, "🎉 **تم حفظ جميع الإعدادات بنجاح!**\n\nالآن قم بتحويل أو إرسال أي ملف MP3، وسأقوم بتعديله لك فوراً."))
@@ -151,7 +151,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		bot.Send(tgbotapi.NewMessage(chatID, "⏳ جاري استخراج الصوت وتطبيق الإعدادات..."))
+		bot.Send(tgbotapi.NewMessage(chatID, "⏳ جاري استخراج الصوت وتطبيق الإعدادات بدقة..."))
 
 		var fileID string
 		if update.Message.Audio != nil {
@@ -162,22 +162,21 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 		fileURL, err := bot.GetFileDirectURL(fileID)
 		if err != nil {
-			bot.Send(tgbotapi.NewMessage(chatID, "❌ عذراً، الملف كبير جداً أو هناك خطأ في تيليجرام."))
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ عذراً، لا يمكنني تحميل هذا الملف."))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
 		audioData, err := downloadFile(fileURL)
 		if err != nil {
-			bot.Send(tgbotapi.NewMessage(chatID, "❌ فشل تحميل الملف الصوتي."))
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ فشل تحميل الملف الصوتي من سيرفرات تيليجرام."))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// استخراج وإرسال الصورة القديمة 
+		// استخراج الصورة القديمة إن وجدت
 		reader := bytes.NewReader(audioData)
 		tag, err := id3v2.ParseReader(reader, id3v2.Options{Parse: true})
-		
 		if err == nil && tag != nil {
 			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
 			if len(pictures) > 0 {
@@ -189,10 +188,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// استخدام الدالة الجديدة كلياً التي تدمج الموسيقى يدوياً في الذاكرة
-		editedAudio, err := editAudioTagsInMemory(audioData, artist, title, cover)
+		// الدمج باستخدام خوارزمية الذاكرة النظيفة
+		editedAudio, err := editAudioTagsSafely(audioData, artist, title, cover)
 		if err != nil {
-			bot.Send(tgbotapi.NewMessage(chatID, "❌ خطأ في دمج البيانات."))
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ خطأ داخلي أثناء دمج البيانات."))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -254,7 +253,8 @@ func saveUserState(chatID int64, step int, artist, title string, cover []byte) {
 	db.Exec(query, chatID, step, artist, title, cover)
 }
 
-func cropImageFromCenter(url string) ([]byte, error) {
+// الدالة الجديدة: قص الصورة من المنتصف وتصغيرها لمنع تلف الـ MP3
+func cropAndResizeImage(url string) ([]byte, error) {
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -268,19 +268,29 @@ func cropImageFromCenter(url string) ([]byte, error) {
 
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
+
+	// 1. حساب المنتصف لجعلها مربعة
 	size := w
 	if h < w {
 		size = h
 	}
 	startX := (w - size) / 2
 	startY := (h - size) / 2
+	srcRect := image.Rect(bounds.Min.X+startX, bounds.Min.Y+startY, bounds.Min.X+startX+size, bounds.Min.Y+startY+size)
 
-	rect := image.Rect(0, 0, size, size)
-	dst := image.NewRGBA(rect)
-	draw.Draw(dst, rect, img, image.Point{X: bounds.Min.X + startX, Y: bounds.Min.Y + startY}, draw.Src)
+	// 2. تصغير الصورة (حد أقصى 600x600 بكسل) حتى يتعرف تيليجرام على الموسيقى بسرعة
+	outSize := size
+	if outSize > 600 {
+		outSize = 600
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, outSize, outSize))
+	// استخدام تقنية BiLinear للحفاظ على جودة الصورة بعد التصغير
+	draw.BiLinear.Scale(dst, dst.Bounds(), img, srcRect, draw.Src, nil)
 
 	var buf bytes.Buffer
-	err = jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 95})
+	// 3. ضغطها بصيغة JPEG بجودة 85% لتقليل حجم البايتات
+	err = jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 85})
 	return buf.Bytes(), err
 }
 
@@ -290,36 +300,33 @@ func downloadFile(url string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bad status: %d", resp.StatusCode)
-	}
 	return io.ReadAll(resp.Body)
 }
 
-// ----------------------------------------------------
-// الحل الجذري: دمج البيانات والموسيقى يدوياً داخل الذاكرة
-// ----------------------------------------------------
-func editAudioTagsInMemory(originalAudio []byte, artist, title string, cover []byte) ([]byte, error) {
-	reader := bytes.NewReader(originalAudio)
-	
-	// 1. قراءة الملف الأصلي لتحديد مساحة الإعدادات القديمة
-	_, err := id3v2.ParseReader(reader, id3v2.Options{Parse: true})
-	
-	audioDataOffset := int64(0)
-	if err == nil {
-		// حساب حجم الإعدادات القديمة بالضبط
-		audioDataOffset = reader.Size() - int64(reader.Len())
+// دالة ذكية لتخطي الـ Tags القديمة بدقة
+func skipOldID3Tags(data []byte) []byte {
+	offset := 0
+	for offset+10 <= len(data) {
+		if string(data[offset:offset+3]) == "ID3" {
+			// حساب حجم الـ Tag القديم بالبتات للقفز فوقه مباشرة
+			size := (int(data[offset+6]) << 21) | (int(data[offset+7]) << 14) | (int(data[offset+8]) << 7) | int(data[offset+9])
+			offset += 10 + size
+		} else {
+			break
+		}
 	}
-
-	// حماية إضافية
-	if audioDataOffset < 0 || audioDataOffset > int64(len(originalAudio)) {
-		audioDataOffset = 0
+	if offset >= len(data) {
+		return []byte{}
 	}
+	return data[offset:] // الموسيقى الصافية فقط!
+}
 
-	// 2. قص الموسيقى الصافية فقط (بدون التخريب القديم)
-	rawAudio := originalAudio[audioDataOffset:]
+// دالة دمج الصوت مع الإعدادات الجديدة بدون المساس بالملفات المؤقتة
+func editAudioTagsSafely(originalAudio []byte, artist, title string, cover []byte) ([]byte, error) {
+	// 1. استخراج الصوت الصافي
+	rawAudio := skipOldID3Tags(originalAudio)
 
-	// 3. تصميم الإعدادات الجديدة 
+	// 2. إنشاء الهيكل الجديد للإعدادات
 	newTag := id3v2.NewEmptyTag()
 	newTag.SetArtist(artist)
 	newTag.SetTitle(title)
@@ -335,13 +342,13 @@ func editAudioTagsInMemory(originalAudio []byte, artist, title string, cover []b
 		newTag.AddAttachedPicture(pic)
 	}
 
-	// 4. كتابة الإعدادات الجديدة + لصق الموسيقى الصافية خلفها مباشرة
 	var buf bytes.Buffer
+	// 3. كتابة الإعدادات الجديدة في الذاكرة
 	if _, err := newTag.WriteTo(&buf); err != nil {
 		return nil, err
 	}
 	
-	// هنا يكمن السر: ندمج الموسيقى يدوياً لضمان عدم ضياعها!
+	// 4. لصق الموسيقى الصافية مباشرة خلف الصورة والأسماء
 	buf.Write(rawAudio) 
 
 	return buf.Bytes(), nil
