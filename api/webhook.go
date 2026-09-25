@@ -138,14 +138,16 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// استخراج الصورة القديمة
+		// التعديل هنا: الطريقة الصحيحة لاستخراج الصورة القديمة باستخدام مكتبة id3v2
 		tag, err := id3v2.ParseReader(bytes.NewReader(audioData), id3v2.Options{Parse: true})
 		if err == nil {
-			pictures := tag.AttachedPictures()
+			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
 			if len(pictures) > 0 {
-				picMsg := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{Name: "old_cover.jpg", Bytes: pictures[0].Picture})
-				picMsg.Caption = "🖼 الصورة المصغرة الأصلية."
-				bot.Send(picMsg)
+				if pic, ok := pictures[0].(id3v2.PictureFrame); ok {
+					picMsg := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{Name: "old_cover.jpg", Bytes: pic.Picture})
+					picMsg.Caption = "🖼 الصورة المصغرة الأصلية."
+					bot.Send(picMsg)
+				}
 			}
 		}
 
