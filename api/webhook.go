@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/jpeg"
 	_ "image/png"
@@ -19,13 +20,11 @@ import (
 
 var db *sql.DB
 
-// دالة التهيئة تعمل تلقائياً للاتصال بقاعدة البيانات وإنشاء الجدول
 func init() {
-	var err error
 	connStr := os.Getenv("POSTGRES_URL")
 	if connStr != "" {
-		db, err = sql.Open("postgres", connStr)
-		if err == nil {
+		db, _ = sql.Open("postgres", connStr)
+		if db != nil {
 			createTable := `
 			CREATE TABLE IF NOT EXISTS user_settings (
 				chat_id BIGINT PRIMARY KEY,
@@ -58,6 +57,42 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ----------------------------------------------------
+	// 1. التعامل مع الأزرار الشفافة والملونة (Callback Query)
+	// ----------------------------------------------------
+	if update.CallbackQuery != nil {
+		chatID := update.CallbackQuery.Message.Chat.ID
+		data := update.CallbackQuery.Data
+
+		// إخفاء علامة التحميل (الساعة الرملية) من الزر
+		bot.Request(tgbotapi.NewCallback(update.CallbackQuery.ID, ""))
+
+		var artist, title string
+		var cover []byte
+		db.QueryRow("SELECT artist, title, cover FROM user_settings WHERE chat_id = $1", chatID).Scan(&artist, &title, &cover)
+
+		switch data {
+		case "settings":
+			saveUserState(chatID, 1, artist, title, cover)
+			msg := tgbotapi.NewMessage(chatID, "✨ **بدء ضبط الإعدادات**\n\n🎤 أرسل لي الآن **اسم الفنان**:")
+			msg.ReplyMarkup = cancelKeyboard() // زر إلغاء عادي
+			bot.Send(msg)
+		case "cancel":
+			saveUserState(chatID, 4, artist, title, cover) // العودة لوضع الاستعداد
+			msg := tgbotapi.NewMessage(chatID, "❌ **تم إلغاء العملية.**\nتم الحفاظ على إعداداتك السابقة.")
+			bot.Send(msg)
+		case "status":
+			if artist == "" {
+				bot.Send(tgbotapi.NewMessage(chatID, "⚠️ لم تقم بضبط أي إعدادات بعد."))
+			} else {
+				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ **إعداداتك الحالية:**\n\n🎤 الفنان: %s\n🎵 العنوان: %s\n\nأرسل أي ملف صوتي لتطبيقها فوراً.", artist, title))
+				bot.Send(msg)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if update.Message == nil {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -70,32 +105,38 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	var step int
 	var artist, title string
 	var cover []byte
-
 	err = db.QueryRow("SELECT step, artist, title, cover FROM user_settings WHERE chat_id = $1", chatID).Scan(&step, &artist, &title, &cover)
 	if err == sql.ErrNoRows {
-		step = 0 // مستخدم جديد
+		step = 0
 	}
 
-	// 1. التعامل مع الأوامر
+	// ----------------------------------------------------
+	// 2. التعامل مع الأوامر (/start)
+	// ----------------------------------------------------
 	if update.Message.IsCommand() {
 		switch update.Message.Command() {
-		case "start", "settings":
-			saveUserState(chatID, 1, "", "", nil)
-			bot.Send(tgbotapi.NewMessage(chatID, "مرحباً! لنقم بضبط الإعدادات ⚙️\n\nأرسل لي الآن **اسم الفنان**: "))
+		case "start", "menu":
+			sendColoredMainMenu(botToken, chatID) // استدعاء الدالة المخصصة للأزرار الملونة
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}
 
-	// 2. التعامل مع خطوات إعداد البوت
+	// ----------------------------------------------------
+	// 3. مسار المحادثة (State Machine)
+	// ----------------------------------------------------
 	if step == 1 && text != "" {
 		saveUserState(chatID, 2, text, title, cover)
-		bot.Send(tgbotapi.NewMessage(chatID, "تم حفظ الفنان ✅\nأرسل الآن **اسم الملف الصوتي (العنوان)**: "))
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ تم حفظ الفنان: **%s**\n\n🎵 أرسل الآن **اسم الملف الصوتي (العنوان)**:", text))
+		msg.ReplyMarkup = cancelKeyboard()
+		bot.Send(msg)
 		w.WriteHeader(http.StatusOK)
 		return
 	} else if step == 2 && text != "" {
 		saveUserState(chatID, 3, artist, text, cover)
-		bot.Send(tgbotapi.NewMessage(chatID, "تم حفظ العنوان ✅\nأرسل الآن **الصورة المصغرة** (سيتم قص المنتصف تلقائياً): "))
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ تم حفظ العنوان: **%s**\n\n🖼 أرسل الآن **الصورة المصغرة** (سيتم قص المنتصف تلقائياً):", text))
+		msg.ReplyMarkup = cancelKeyboard()
+		bot.Send(msg)
 		w.WriteHeader(http.StatusOK)
 		return
 	} else if step == 3 && len(update.Message.Photo) > 0 {
@@ -107,16 +148,19 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ حدث خطأ أثناء قص الصورة. حاول إرسال صورة أخرى."))
 		} else {
 			saveUserState(chatID, 4, artist, title, croppedImg)
-			bot.Send(tgbotapi.NewMessage(chatID, "✅ **تم حفظ الإعدادات بنجاح في قاعدة البيانات!**\nالآن أرسل أي ملف صوتي وسأقوم بتعديله فوراً."))
+			bot.Send(tgbotapi.NewMessage(chatID, "🎉 **تم حفظ جميع الإعدادات بنجاح!**\n\nالآن قم بتحويل أو إرسال أي ملف MP3، وسأقوم بتعديله لك فوراً."))
 		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// 3. التعامل مع الملفات الصوتية المُرسلة
+	// ----------------------------------------------------
+	// 4. معالجة الملفات الصوتية المُرسلة
+	// ----------------------------------------------------
 	if update.Message.Audio != nil || update.Message.Document != nil {
-		if step != 4 {
-			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ يجب إكمال الإعدادات أولاً. أرسل /settings للبدء."))
+		if step != 4 || artist == "" {
+			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ يجب إكمال الإعدادات أولاً."))
+			sendColoredMainMenu(botToken, chatID)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -138,20 +182,20 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// التعديل هنا: الطريقة الصحيحة لاستخراج الصورة القديمة باستخدام مكتبة id3v2
+		// استخراج وإرسال الصورة القديمة
 		tag, err := id3v2.ParseReader(bytes.NewReader(audioData), id3v2.Options{Parse: true})
 		if err == nil {
 			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
 			if len(pictures) > 0 {
 				if pic, ok := pictures[0].(id3v2.PictureFrame); ok {
 					picMsg := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{Name: "old_cover.jpg", Bytes: pic.Picture})
-					picMsg.Caption = "🖼 الصورة المصغرة الأصلية."
+					picMsg.Caption = "🖼 الصورة المصغرة الأصلية للملف."
 					bot.Send(picMsg)
 				}
 			}
 		}
 
-		// تعديل الملف
+		// تعديل الملف وإرساله
 		editedAudio, err := editAudioTags(audioData, artist, title, cover)
 		if err != nil {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ خطأ في دمج البيانات."))
@@ -159,7 +203,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// إرسال الملف المعدل
 		audioMsg := tgbotapi.NewAudio(chatID, tgbotapi.FileBytes{Name: title + ".mp3", Bytes: editedAudio})
 		audioMsg.Performer = artist
 		audioMsg.Title = title
@@ -172,7 +215,54 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// دالة لحفظ وتحديث بيانات المستخدم في قاعدة البيانات
+// ----------------------------------------------------
+// دوال واجهة المستخدم (UI) والأزرار الملونة
+// ----------------------------------------------------
+
+// زر الإلغاء العادي المستخدم أثناء الإعداد
+func cancelKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ إلغاء الإعداد", "cancel"),
+		),
+	)
+}
+
+// دالة مخصصة لإرسال أزرار ملونة تتخطى قيود المكتبة القديمة وتخاطب API تيليجرام مباشرة
+func sendColoredMainMenu(botToken string, chatID int64) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
+
+	// بناء الـ JSON الخاص بتيليجرام مع إضافة حقل "style" الجديد
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"text":       "🎧 **مرحباً بك في بوت تعديل الصوتيات!**\n\nيُرجى اختيار إجراء من القائمة أدناه:",
+		"parse_mode": "Markdown",
+		"reply_markup": map[string]interface{}{
+			"inline_keyboard": [][]map[string]interface{}{
+				{
+					// زر باللون الأزرق (الأساسي)
+					{"text": "⚙️ إعداد صورة واسم جديد للملف", "callback_data": "settings", "style": "primary"},
+				},
+				{
+					// زر شفاف/أبيض (افتراضي)
+					{"text": "ℹ️ عرض الإعدادات الحالية", "callback_data": "status"},
+				},
+				{
+					// زر باللون الأحمر (للتحذير/الإلغاء)
+					{"text": "🗑 إلغاء", "callback_data": "cancel", "style": "danger"},
+				},
+			},
+		},
+	}
+
+	jsonPayload, _ := json.Marshal(payload)
+	http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+}
+
+// ----------------------------------------------------
+// الدوال المساعدة (معالجة الصور والبيانات)
+// ----------------------------------------------------
+
 func saveUserState(chatID int64, step int, artist, title string, cover []byte) {
 	if cover == nil {
 		cover = []byte{}
@@ -205,13 +295,11 @@ func cropImageFromCenter(url string) ([]byte, error) {
 	if h < w {
 		size = h
 	}
-
 	startX := (w - size) / 2
 	startY := (h - size) / 2
 
 	rect := image.Rect(0, 0, size, size)
 	dst := image.NewRGBA(rect)
-
 	draw.Draw(dst, rect, img, image.Point{X: bounds.Min.X + startX, Y: bounds.Min.Y + startY}, draw.Src)
 
 	var buf bytes.Buffer
@@ -252,6 +340,5 @@ func editAudioTags(originalAudio []byte, artist, title string, cover []byte) ([]
 	if _, err = tag.WriteTo(&buf); err != nil {
 		return nil, err
 	}
-
 	return buf.Bytes(), nil
 }
