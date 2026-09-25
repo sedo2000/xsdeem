@@ -57,7 +57,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. التعامل مع الأزرار الشفافة والملونة
 	if update.CallbackQuery != nil {
 		chatID := update.CallbackQuery.Message.Chat.ID
 		data := update.CallbackQuery.Data
@@ -106,7 +105,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		step = 0
 	}
 
-	// 2. التعامل مع الأوامر (/start)
 	if update.Message.IsCommand() {
 		switch update.Message.Command() {
 		case "start", "menu":
@@ -116,7 +114,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. مسار المحادثة للإعدادات
 	if step == 1 && text != "" {
 		saveUserState(chatID, 2, text, title, cover)
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ تم حفظ الفنان: **%s**\n\n🎵 أرسل الآن **اسم الملف الصوتي (العنوان)**:", text))
@@ -146,16 +143,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. معالجة الملفات الصوتية المُرسلة
 	if update.Message.Audio != nil || update.Message.Document != nil {
 		if step != 4 || artist == "" {
-			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ يجب إكمال الإعدادات أولاً."))
+			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ يجب إكمال الإعدادات أولاً. استخدم الأزرار للبدء."))
 			sendColoredMainMenu(botToken, chatID)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		bot.Send(tgbotapi.NewMessage(chatID, "⏳ جاري المعالجة..."))
+		bot.Send(tgbotapi.NewMessage(chatID, "⏳ جاري استخراج الصوت وتطبيق الإعدادات..."))
 
 		var fileID string
 		if update.Message.Audio != nil {
@@ -164,7 +160,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			fileID = update.Message.Document.FileID
 		}
 
-		fileURL, _ := bot.GetFileDirectURL(fileID)
+		fileURL, err := bot.GetFileDirectURL(fileID)
+		if err != nil {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ عذراً، الملف كبير جداً أو هناك خطأ في تيليجرام."))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		audioData, err := downloadFile(fileURL)
 		if err != nil {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ فشل تحميل الملف الصوتي."))
@@ -172,8 +174,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		tag, err := id3v2.ParseReader(bytes.NewReader(audioData), id3v2.Options{Parse: true})
-		if err == nil {
+		// استخراج وإرسال الصورة القديمة 
+		reader := bytes.NewReader(audioData)
+		tag, err := id3v2.ParseReader(reader, id3v2.Options{Parse: true})
+		
+		if err == nil && tag != nil {
 			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
 			if len(pictures) > 0 {
 				if pic, ok := pictures[0].(id3v2.PictureFrame); ok {
@@ -184,8 +189,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// استدعاء دالة التعديل الجديدة التي تحافظ على الصوت
-		editedAudio, err := editAudioTags(audioData, artist, title, cover)
+		// استخدام الدالة الجديدة كلياً التي تدمج الموسيقى يدوياً في الذاكرة
+		editedAudio, err := editAudioTagsInMemory(audioData, artist, title, cover)
 		if err != nil {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ خطأ في دمج البيانات."))
 			w.WriteHeader(http.StatusOK)
@@ -204,10 +209,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ----------------------------------------------------
-// دوال واجهة المستخدم (UI) والأزرار الملونة
-// ----------------------------------------------------
-
 func cancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -218,7 +219,6 @@ func cancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 
 func sendColoredMainMenu(botToken string, chatID int64) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
-
 	payload := map[string]interface{}{
 		"chat_id":    chatID,
 		"text":       "🎧 **مرحباً بك في بوت تعديل الصوتيات!**\n\nيُرجى اختيار إجراء من القائمة أدناه:",
@@ -237,14 +237,9 @@ func sendColoredMainMenu(botToken string, chatID int64) {
 			},
 		},
 	}
-
 	jsonPayload, _ := json.Marshal(payload)
 	http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
 }
-
-// ----------------------------------------------------
-// الدوال المساعدة (معالجة الصور والبيانات)
-// ----------------------------------------------------
 
 func saveUserState(chatID int64, step int, artist, title string, cover []byte) {
 	if cover == nil {
@@ -273,7 +268,6 @@ func cropImageFromCenter(url string) ([]byte, error) {
 
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
-
 	size := w
 	if h < w {
 		size = h
@@ -296,38 +290,39 @@ func downloadFile(url string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status: %d", resp.StatusCode)
+	}
 	return io.ReadAll(resp.Body)
 }
 
-// الدالة الجديدة والمحسنة للحفاظ على الصوت (تستخدم ملف مؤقت)
-func editAudioTags(originalAudio []byte, artist, title string, cover []byte) ([]byte, error) {
-	// 1. إنشاء ملف مؤقت في بيئة Vercel
-	tmpFile, err := os.CreateTemp("", "audio-*.mp3")
-	if err != nil {
-		return nil, err
-	}
-	tmpFileName := tmpFile.Name()
+// ----------------------------------------------------
+// الحل الجذري: دمج البيانات والموسيقى يدوياً داخل الذاكرة
+// ----------------------------------------------------
+func editAudioTagsInMemory(originalAudio []byte, artist, title string, cover []byte) ([]byte, error) {
+	reader := bytes.NewReader(originalAudio)
 	
-	// تأكد من حذف الملف المؤقت بعد انتهاء العملية لتنظيف الذاكرة
-	defer os.Remove(tmpFileName)
-
-	// 2. كتابة الملف الصوتي الأصلي بالكامل داخل الملف المؤقت (لكي نحافظ على الصوت)
-	if _, err := tmpFile.Write(originalAudio); err != nil {
-		tmpFile.Close()
-		return nil, err
+	// 1. قراءة الملف الأصلي لتحديد مساحة الإعدادات القديمة
+	_, err := id3v2.ParseReader(reader, id3v2.Options{Parse: true})
+	
+	audioDataOffset := int64(0)
+	if err == nil {
+		// حساب حجم الإعدادات القديمة بالضبط
+		audioDataOffset = reader.Size() - int64(reader.Len())
 	}
-	tmpFile.Close() // يجب إغلاقه لتتمكن المكتبة من التعديل عليه براحة
 
-	// 3. فتح الملف عبر مكتبة التعديل
-	tag, err := id3v2.Open(tmpFileName, id3v2.Options{Parse: true})
-	if err != nil {
-		return nil, err
+	// حماية إضافية
+	if audioDataOffset < 0 || audioDataOffset > int64(len(originalAudio)) {
+		audioDataOffset = 0
 	}
-	defer tag.Close()
 
-	// 4. وضع الإعدادات الجديدة
-	tag.SetArtist(artist)
-	tag.SetTitle(title)
+	// 2. قص الموسيقى الصافية فقط (بدون التخريب القديم)
+	rawAudio := originalAudio[audioDataOffset:]
+
+	// 3. تصميم الإعدادات الجديدة 
+	newTag := id3v2.NewEmptyTag()
+	newTag.SetArtist(artist)
+	newTag.SetTitle(title)
 
 	if len(cover) > 0 {
 		pic := id3v2.PictureFrame{
@@ -337,14 +332,17 @@ func editAudioTags(originalAudio []byte, artist, title string, cover []byte) ([]
 			Description: "Cover",
 			Picture:     cover,
 		}
-		tag.AddAttachedPicture(pic)
+		newTag.AddAttachedPicture(pic)
 	}
 
-	// 5. حفظ التعديلات على نفس الملف (هذا الأمر يغير البيانات ويحتفظ بالصوت!)
-	if err = tag.Save(); err != nil {
+	// 4. كتابة الإعدادات الجديدة + لصق الموسيقى الصافية خلفها مباشرة
+	var buf bytes.Buffer
+	if _, err := newTag.WriteTo(&buf); err != nil {
 		return nil, err
 	}
+	
+	// هنا يكمن السر: ندمج الموسيقى يدوياً لضمان عدم ضياعها!
+	buf.Write(rawAudio) 
 
-	// 6. قراءة الملف المُعدل بالكامل كبايتات لإرساله
-	return os.ReadFile(tmpFileName)
+	return buf.Bytes(), nil
 }
